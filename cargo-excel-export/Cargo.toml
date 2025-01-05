@@ -1,0 +1,12 @@
+[package]
+name = "cargo-excel-export"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.28", features = ["full"] }
+tokio-postgres = "0.7"
+postgres = "0.19"
+rust_xlsxwriter = "0.80"
+rayon = "1.7"
+futures = "0.3"
