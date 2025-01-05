@@ -1,98 +1,127 @@
 import psycopg2
-from psycopg2 import Error
-import pandas as pd
+import xlsxwriter
 from datetime import datetime
 import concurrent.futures
-from io import StringIO
+import threading
 import time
+import os
 
-
-def fetch_chunk(connection, offset, chunk_size):
-    """Fetch a chunk of data using server-side cursor"""
-    with connection.cursor("server_side_cursor") as cursor:
+def fetch_chunk(connection, start_id, end_id):
+    """Fetch a chunk of data using server-side cursor with batch fetch"""
+    cursor_name = f"cursor_{start_id}_{end_id}"
+    with connection.cursor(name=cursor_name) as cursor:
+        cursor.itersize = 50000  # Optimize PostgreSQL batch size
         cursor.execute(
             """
-            SELECT * 
-            FROM your_table 
-            ORDER BY id  -- Replace 'id' with your primary key
-            LIMIT %s OFFSET %s
-        """,
-            (chunk_size, offset),
+            SELECT 
+                id::text,
+                col1::text,
+                col2::text,
+                col3::text,
+                col4::text,
+                col5::text,
+                col6::text,
+                col7::text,
+                col8::text,
+                col9::text,
+                col10::text
+            FROM test_table 
+            WHERE id >= %s AND id < %s
+            ORDER BY id
+            """,
+            (start_id, end_id)
         )
-        chunk_data = cursor.fetchall()
-        if chunk_data:
-            # Get column names from cursor description
-            columns = [desc[0] for desc in cursor.description]
-            return pd.DataFrame(chunk_data, columns=columns)
-    return None
-
+        return cursor.fetchall()
 
 def process_and_save_data():
     try:
-        # Connection parameters
-        connection = psycopg2.connect(host="localhost", database="test_db", user="user")
+        # Enable faster TCP keepalives
+        connection = psycopg2.connect(
+            host="localhost", 
+            database="test_db", 
+            user="user", 
+            password="password",
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5
+        )
+        
+        # Ultra aggressive settings
+        CHUNK_SIZE = 1000000  # 1 million rows per chunk
+        MAX_WORKERS = min(32, os.cpu_count() * 4)  # More aggressive threading
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        excel_file = f"large_data_export_{timestamp}.xlsx"
+
+        # Optimized workbook settings
+        workbook = xlsxwriter.Workbook(
+            excel_file, 
+            {
+                'constant_memory': True,
+                'strings_to_urls': False,
+                'strings_to_formulas': False,
+                'strings_to_numbers': False,
+                'default_format_properties': {'font_size': 10}
+            }
+        )
+        worksheet = workbook.add_worksheet('Data')
+
+        # Pre-format columns for better performance
+        worksheet.set_column(0, 10, 15)  # Set width for all columns at once
+
+        headers = ['id', 'col1', 'col2', 'col3', 'col4', 'col5', 
+                  'col6', 'col7', 'col8', 'col9', 'col10']
+        worksheet.write_row(0, 0, headers)
 
         start_time = time.time()
 
-        # Configure chunk size and parallel workers
-        CHUNK_SIZE = 100000  # Adjust based on your memory capacity
-        MAX_WORKERS = 4  # Adjust based on your CPU cores
-
-        # Create Excel writer with performance options
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        excel_file = f"large_data_export_{timestamp}.xlsx"
-        writer = pd.ExcelWriter(
-            excel_file, engine="xlsxwriter", options={"constant_memory": True}
-        )
-
-        # Get total count of rows
+        # Get row count and ID range
         with connection.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) FROM your_table")
-            total_rows = cursor.fetchone()[0]
+            cursor.execute("SELECT MIN(id), MAX(id) FROM test_table")
+            min_id, max_id = cursor.fetchone()
 
-        print(f"Total rows to process: {total_rows}")
+        # Calculate chunk boundaries
+        total_range = max_id - min_id + 1
+        chunk_size = total_range // MAX_WORKERS
+        chunks = [
+            (min_id + i * chunk_size, min_id + (i + 1) * chunk_size)
+            for i in range(MAX_WORKERS - 1)
+        ]
+        chunks.append((min_id + (MAX_WORKERS - 1) * chunk_size, max_id + 1))
 
-        # Process data in chunks using parallel execution
+        current_row = 1
+        row_lock = threading.Lock()
+
+        def process_and_write_chunk(chunk_range):
+            nonlocal current_row
+            chunk_data = fetch_chunk(connection, chunk_range[0], chunk_range[1])
+            with row_lock:
+                nonlocal worksheet
+                row = current_row
+                current_row += len(chunk_data)
+                for idx, data in enumerate(chunk_data):
+                    worksheet.write_row(row + idx, 0, data)
+                return len(chunk_data)
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = []
-            for offset in range(0, total_rows, CHUNK_SIZE):
-                futures.append(
-                    executor.submit(fetch_chunk, connection, offset, CHUNK_SIZE)
-                )
+            futures = [executor.submit(process_and_write_chunk, chunk) for chunk in chunks]
+            
+            for future in concurrent.futures.as_completed(futures):
+                rows_processed = future.result()
+                print(f"Processed {rows_processed} rows")
 
-            # Process completed chunks and write to Excel
-            for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                chunk_df = future.result()
-                if chunk_df is not None:
-                    # Write chunk to Excel file
-                    start_row = i * CHUNK_SIZE
-                    chunk_df.to_excel(
-                        writer,
-                        sheet_name="Data",
-                        startrow=start_row + 1 if i > 0 else 0,
-                        header=True if i == 0 else False,
-                        index=False,
-                    )
-
-                    print(
-                        f"Processed chunk {i+1}: rows {start_row} to {start_row + len(chunk_df)}"
-                    )
-
-        # Save and close Excel file
-        writer.close()
-
-        end_time = time.time()
-        print(f"\nExport completed in {end_time - start_time:.2f} seconds")
+        workbook.close()
+        elapsed = time.time() - start_time
+        print(f"\nExport completed in {elapsed:.2f} seconds")
+        print(f"Average speed: {(current_row-1)/elapsed:.0f} rows/second")
         print(f"Data exported to: {excel_file}")
 
-    except (Exception, Error) as error:
+    except Exception as error:
         print("Error:", error)
-
     finally:
         if connection:
             connection.close()
-            print("PostgreSQL connection closed")
-
 
 if __name__ == "__main__":
     process_and_save_data()
