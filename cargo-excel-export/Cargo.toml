@@ -11,3 +11,8 @@ rust_xlsxwriter = "0.80"
 rayon = "1.7"
 futures = "0.3"
 chrono = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
