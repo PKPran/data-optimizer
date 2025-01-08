@@ -2,6 +2,7 @@ use postgres::{Client, NoTls};
 use rust_xlsxwriter::{Workbook, Format, Color};
 use rayon::prelude::*;
 use std::time::Instant;
+use std::io::BufRead;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let start = Instant::now();
@@ -9,47 +10,62 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connection settings
     let conn_str = "postgresql://user:password@localhost/test_db";
     
-    // Get total count and ID ranges
-    let mut client = Client::connect(conn_str, NoTls)?;
-    let row = client.query_one("SELECT MIN(id), MAX(id) FROM test_table", &[])?;
-    let min_id: i32 = row.get(0);
-    let max_id: i32 = row.get(1);
+    const TOTAL_ROWS: usize = 1_000_000;
+    const CHUNK_SIZE: usize = 250_000; // 4 chunks total
     
-    // Calculate chunk sizes
-    let chunk_size = 50_000;
-    let num_chunks = ((max_id - min_id) as f64 / chunk_size as f64).ceil() as i32;
-    let chunks: Vec<(i32, i32)> = (0..num_chunks)
-        .map(|i| {
-            let start = min_id + (i * chunk_size);
-            let end = std::cmp::min(start + chunk_size, max_id + 1);
-            (start, end)
-        })
-        .collect();
+    println!("Total rows in database: {}", TOTAL_ROWS);
+    
+    // Pre-allocate with exact size
+    let mut all_rows: Vec<Vec<String>> = Vec::with_capacity(TOTAL_ROWS);
+    
+    // Create 4 fixed chunks with exact ranges
+    let chunks = vec![
+        (1, 250_001),         // 1 to 250k
+        (250_001, 500_001),   // 250k to 500k
+        (500_001, 750_001),   // 500k to 750k
+        (750_001, 1_000_001)  // 750k to 1M
+    ];
 
-    println!("Processing {} chunks...", chunks.len());
-
-    // Collect all data in parallel
-    let all_rows: Vec<Vec<String>> = chunks.par_iter()
+    let processed_chunks = std::sync::atomic::AtomicUsize::new(0);
+    
+    // Use COPY command for faster data transfer
+    chunks.par_iter()
         .flat_map(|(start_id, end_id)| {
             let mut conn = Client::connect(conn_str, NoTls).unwrap();
-            conn.query(
-                "SELECT id::text, col1::text, col2::text, col3::text, col4::text, 
-                        col5::text, col6::text, col7::text, col8::text, col9::text, 
-                        col10::text 
-                 FROM test_table 
-                 WHERE id >= $1 AND id < $2 
-                 ORDER BY id",
-                &[start_id, end_id],
-            ).unwrap()
-            .iter()
-            .map(|row| (0..11)
-                .map(|i| row.get::<_, Option<String>>(i).unwrap_or_default())
-                .collect())
-            .collect::<Vec<Vec<String>>>()
-        })
-        .collect();
+            
+            // Pre-allocate chunk size
+            let mut chunk_rows = Vec::with_capacity(CHUNK_SIZE);
+            
+            // Use COPY for faster data transfer
+            let copy_sql = format!(
+                "COPY (
+                    SELECT id::text, col1::text, col2::text, col3::text, col4::text, 
+                           col5::text, col6::text, col7::text, col8::text, col9::text, 
+                           col10::text 
+                    FROM test_table 
+                    WHERE id >= {} AND id < {} 
+                    ORDER BY id
+                ) TO STDOUT WITH (FORMAT CSV)", 
+                start_id, end_id
+            );
+            
+            conn.copy_out(&copy_sql)
+                .unwrap()
+                .lines()
+                .filter_map(Result::ok)
+                .map(|line| line.split(',').map(String::from).collect())
+                .for_each(|row| chunk_rows.push(row));
 
-    println!("Writing {} rows to Excel...", all_rows.len());
+            let current = processed_chunks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            println!("Progress: {}/4 chunks processed", current);
+
+            chunk_rows
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .for_each(|row| all_rows.push(row));
+
+    println!("\nFetched {} rows, writing to Excel...", all_rows.len());
 
     // Create workbook and write data
     let mut workbook = Workbook::new();
