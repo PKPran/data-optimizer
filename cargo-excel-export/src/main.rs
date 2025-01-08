@@ -8,7 +8,6 @@ use rayon::prelude::*;
 use std::sync::Mutex;
 
 const CHUNK_SIZE: usize = 250_000;
-const COLUMN_WIDTH: f64 = 15.0;
 const BUFFER_CAPACITY: usize = 8192;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -89,13 +88,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let worksheet = workbook.add_worksheet();
         worksheet.set_name(&format!("Sheet_{}", sheet_idx + 1))?;
 
-        // Write headers
+        // Write headers with minimal formatting
         for (col, &header) in headers.iter().enumerate() {
             worksheet.write_string_with_format(0, col as u16, header, &header_format)?;
-            worksheet.set_column_width(col as u16, COLUMN_WIDTH)?;
         }
 
-        // Write data
+        // Write data without any formatting
         for (row, col, value) in worksheet_data {
             worksheet.write_string(row, col, &value)?;
         }
