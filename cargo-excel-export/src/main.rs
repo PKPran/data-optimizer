@@ -3,12 +3,13 @@ use std::time::Instant;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::io::BufRead;
-use rust_xlsxwriter::{Workbook, Format, Color};
+use rust_xlsxwriter::{Workbook, Format};
 use rayon::prelude::*;
 use std::sync::Mutex;
 
 const CHUNK_SIZE: usize = 250_000;
-const BUFFER_CAPACITY: usize = 8192;
+const BUFFER_CAPACITY: usize = 32768;
+const EXCEL_BATCH_SIZE: usize = 5000;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let start = Instant::now();
@@ -20,9 +21,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create workbook and wrap in Mutex for thread safety
     let workbook = Arc::new(Mutex::new(Workbook::new()));
     
-    let header_format = Format::new()
-        .set_bold()
-        .set_background_color(Color::RGB(0xD8E4BC));
+    // Simplified header format
+    let header_format = Format::new().set_bold();
 
     let headers = ["id", "col1", "col2", "col3", "col4", "col5", 
                   "col6", "col7", "col8", "col9", "col10"];
@@ -30,6 +30,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Progress counter
     let row_counter = Arc::new(AtomicU32::new(0));
     let progress_interval = (TOTAL_ROWS / 20) as u32;
+
+    // Configure thread pool for optimal performance
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build_global()?;
 
     // Process database in chunks
     let chunks: Vec<_> = (0..4)
@@ -93,9 +98,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             worksheet.write_string_with_format(0, col as u16, header, &header_format)?;
         }
 
-        // Write data without any formatting
-        for (row, col, value) in worksheet_data {
-            worksheet.write_string(row, col, &value)?;
+        // Write data in larger batches
+        for chunk in worksheet_data.chunks(EXCEL_BATCH_SIZE) {
+            for &(row, col, ref value) in chunk {
+                worksheet.write_string(row, col, value)?;
+            }
         }
 
         println!("Completed sheet {} ({} rows)", sheet_idx + 1, current_row - 1);
